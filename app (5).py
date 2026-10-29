@@ -11,6 +11,7 @@ import joblib
 import plotly.express as px
 import plotly.graph_objects as go
 from datetime import date, timedelta
+from scipy.stats import norm
 from sklearn.feature_extraction.text import TfidfVectorizer, ENGLISH_STOP_WORDS
 from sklearn.metrics.pairwise import cosine_similarity
 
@@ -392,6 +393,18 @@ def buses_for(riders, cap):
     return int(math.ceil(round(float(riders)) / max(int(cap), 1)))
 
 
+MIN_CHANGE_PCT = 0.05          # a route is only flagged when the forecast differs from usual by at least 5 percent
+MIN_CHANGE_BUSLOAD = 0.5       # ... and by at least half a bus-load of riders (so tiny routes do not flip by rounding)
+
+
+def bus_numbers(pred, usual, cap):
+    """(buses needed, buses normally run). They only differ when the forecast is clearly above or below usual."""
+    normal, need = buses_for(usual, cap), buses_for(pred, cap)
+    if abs(float(pred) - float(usual)) < max(MIN_CHANGE_PCT * float(usual), MIN_CHANGE_BUSLOAD * cap):
+        need = normal
+    return need, normal
+
+
 @st.cache_data(show_spinner="Calculating demand for all routes...")
 def route_table(day_iso, hour, cap):
     """One row per route: forecast, usual riders, buses needed now and buses normally run at this hour."""
@@ -401,8 +414,10 @@ def route_table(day_iso, hour, cap):
     peak = np.array([float(PEAK.get((r, eff_dow(d)), 0.0)) for r in ROUTES])
     ratio = np.where(peak > 0, pred / np.where(peak > 0, peak, 1), 0.0)
     levels = [level_of(r) for r in ratio]
-    need = np.ceil(np.round(pred) / max(cap, 1)).astype(int)
+    need_raw = np.ceil(np.round(pred) / max(cap, 1)).astype(int)
     normal = np.ceil(np.round(usual) / max(cap, 1)).astype(int)
+    real_change = np.abs(pred - usual) >= np.maximum(MIN_CHANGE_PCT * usual, MIN_CHANGE_BUSLOAD * cap)
+    need = np.where(real_change, need_raw, normal)
     return pd.DataFrame({
         'Route': ROUTES, 'Borough': [borough(r) for r in ROUTES],
         'riders': pred, 'Expected riders': np.round(pred).astype(int),
@@ -437,6 +452,46 @@ def build_moves(tbl, limit=12):
                 t[2] -= n
     moves.sort(key=lambda m: (-m['Buses to move'], m['Same borough'] != "Yes"))
     return pd.DataFrame(moves[:limit], columns=['From route', 'To route', 'Buses to move', 'Same borough'])
+
+
+SPREAD = 0.15      # a forecast is typically off by about 15 percent (the WAPE of the best model)
+
+
+def _shortfall(x, mu, sd):
+    """Expected riders above x (what the buses can carry) when the riders are Normal(mu, sd)."""
+    z = (mu - x) / sd
+    return (mu - x) * norm.cdf(z) + sd * norm.pdf(z)
+
+
+def allocate_buses(expected, fleet, cap, running, spread=SPREAD):
+    """Shares a fixed fleet between routes (same method as section 11 of the notebook). Every running route keeps 1 bus.
+    Each further bus goes to the route where it removes the most expected riders without space."""
+    mu = np.maximum(np.asarray(expected, dtype=float), 0.0)
+    sd = np.maximum(spread * mu, 3.0)
+    b = running.astype(int).copy()
+    gain = np.where(running, _shortfall(cap * b, mu, sd) - _shortfall(cap * (b + 1), mu, sd), -1.0)
+    for _ in range(max(int(fleet) - int(b.sum()), 0)):
+        j = int(gain.argmax())
+        b[j] += 1
+        gain[j] = _shortfall(cap * b[j], mu[j], sd[j]) - _shortfall(cap * (b[j] + 1), mu[j], sd[j])
+    return b
+
+
+def fleet_neutral(tbl, cap):
+    """Keeps the total number of buses the same and shares them according to the forecast."""
+    t = tbl.copy()
+    normal = t['Normal buses'].values.astype(int)
+    rec = allocate_buses(t['riders'].values, int(normal.sum()), cap, normal > 0)
+    t['Buses needed'] = rec
+    t['Change'] = rec - normal
+    return t
+
+
+def plan_table(day_iso, hour, cap, area=None, fixed=True):
+    """The route table for the planner: optionally one borough only, optionally with the fleet kept the same."""
+    full = route_table(day_iso, hour, cap)
+    t = full if area in (None, "All boroughs") else full[full['Borough'] == area].reset_index(drop=True)
+    return fleet_neutral(t, cap) if (fixed and len(t)) else t
 
 
 LEVEL_EMOJI = {"Low": "🟢", "Moderate": "🟡", "High": "🔴"}
@@ -745,8 +800,9 @@ def buses_by_hour_fig(route, d, cap):
     """Buses needed in each hour (bars) against the buses normally run (line)."""
     labels = [fmt_hour(h) for h in range(24)]
     pred = np.asarray(day_curve(route, d.isoformat()), dtype=float)
-    need = [buses_for(v, cap) for v in pred]
-    normal = [buses_for(v, cap) for v in usual_curve(route, d)]
+    uc = usual_curve(route, d)
+    pairs = [bus_numbers(p, u, cap) for p, u in zip(pred, uc)]
+    need, normal = [a for a, _ in pairs], [b for _, b in pairs]
     colors = [CORAL if n > m else (TEAL if n < m else INDIGO) for n, m in zip(need, normal)]
     fig = go.Figure()
     fig.add_bar(x=labels, y=need, marker_color=colors, name="Buses needed")
@@ -991,7 +1047,7 @@ def build_prediction_card(route, d, phrase, h, riders, lag_used):
     else:
         note = LEVEL_PLAIN[level]
         method = "Method: calendar model (route, date, hour, holidays)."
-    need, normal = buses_for(riders, get_cap()), buses_for(usual, get_cap())
+    need, normal = bus_numbers(riders, usual, get_cap())
     foot = (f"Needs about {bus_word(need)}; the usual service at this hour is about {bus_word(normal)} "
             f"(if one bus carries {get_cap()} riders an hour, an assumption you can change on the Bus Planner page). "
             f"{method}")
@@ -1012,8 +1068,12 @@ def compare_data(tbl):
     n_more = int((tbl['Change'] > 0).sum())
     n_spare = int((tbl['Change'] < 0).sum())
     if len(moves) == 0:
-        return {'kind': 'compare', 'none': True, 'n_more': n_more, 'n_spare': n_spare,
-                'advice': "Normal service is enough on every route at this time, so there is no need to move buses."}
+        if n_more and not n_spare:
+            msg = (f"{n_more} routes need more buses than usual, but no route has buses to spare at this time. "
+                   "Extra buses would have to come from outside these routes.")
+        else:
+            msg = "Normal service is enough on every route at this time, so there is no need to move buses."
+        return {'kind': 'compare', 'none': True, 'n_more': n_more, 'n_spare': n_spare, 'advice': msg}
     mv = moves.iloc[0]
     rows = tbl.set_index('Route')
 
@@ -1168,7 +1228,7 @@ def answer_compare(hour, day):
     d, phrase = _date_or_default(day, ctx)
     ctx['hour'], ctx['date'], ctx['phrase'] = hour, d, phrase
 
-    tbl = route_table(d.isoformat(), hour, get_cap())
+    tbl = plan_table(d.isoformat(), hour, get_cap())
     card = compare_data(tbl)
     text = (f"At **{fmt_hour(hour)}**, {phrase}: **{card['n_more']}** routes need more buses than usual and "
             f"**{card['n_spare']}** can spare some. The 5 routes with the biggest change:")
@@ -1270,6 +1330,12 @@ def _answer(prompt):
         st.session_state['_route_from_ctx'] = route is None and not overall
         return answer_peak(route, day, overall)
 
+    if re.search(r'(does|do|is|did)\b.{0,40}(allocation|sharing|shared).{0,30}(help|work well|better|improve|useful)|'
+                 r'allocation (test|result|evidence)|how much (better|fewer)|riders without space', t):
+        doc = answer_doc("Does the allocation help? (test result)")
+        if doc:
+            return doc
+
     if re.search(r'how (does|do|is|are)\b.{0,40}(allocation|buses needed|bus plan)|what is (the )?resource allocation', t):
         doc = answer_doc("Buses needed and buses normally run" if re.search(r'buses needed', t) else "Resource allocation advice")
         if doc:
@@ -1304,6 +1370,7 @@ def build_knowledge():
     n_routes, test_rows = info['n_routes'], info['test_rows']
     gain = (100 * (base['MAE'] - best['MAE']) / base['MAE']) if best and base and base['MAE'] else None
     bt = BACKTEST
+    ALLOC = info.get('allocation')
     cards = []
 
     def card(title, text, keywords="", table=None, cat="Project"):
@@ -1427,16 +1494,30 @@ def build_knowledge():
             "in testing."),
          "how prediction works inputs steps process method used", cat="App")
     card("Buses needed and buses normally run",
-         "Buses needed = expected riders divided by how many riders one bus can carry per hour (an assumption set on "
-         "the Bus Planner page, because the data has no bus capacity or timetable). Buses normally run = the same "
-         "calculation for the usual riders at that hour. The difference is how many buses to add or spare.",
+         "Normal buses = riders the usual service carries at that hour divided by how many riders one bus can carry "
+         "per hour (an assumption set in the Bus Planner settings, because the data has no bus capacity or "
+         "timetable), rounded up, at least 1 on a route that runs. Buses needed = how the same total number of buses "
+         "is best shared using the forecast. The difference is how many buses to add or spare.",
          "buses needed capacity assumption how many buses fleet size normal service change spare add", cat="App")
     card("Resource allocation advice",
-         "The Bus Planner compares, for every route, the buses needed for the forecast with the buses the usual "
-         "service would run at that hour. Routes that need more are paired with routes that can spare buses, "
-         "same borough first. It is only a suggestion: planners must check depots, vehicles, drivers and schedules.",
+         "The Bus Planner keeps the total number of buses fixed. Every running route keeps 1 bus. Each further bus goes "
+         "to the route where it removes the most expected riders without space, assuming the forecast is typically "
+         "off by about 15%. Routes that gain buses are paired with routes that give buses, same borough first. It is "
+         "only a suggestion: planners must check depots, vehicles, drivers and schedules.",
          "reallocation buses move recommendation fleet allocate suggestion planner resource resource allocation "
-         "how does resource allocation work", cat="App")
+         "how does resource allocation work method algorithm optimization", cat="App")
+    if ALLOC:
+        _a = {r['strategy']: r for r in ALLOC['table']}
+        _f, _u, _p = _a['Our forecast, shared'], _a['Usual service'], _a['Perfect knowledge']
+        card("Does the allocation help? (test result)",
+             f"We tested the allocation on {ALLOC['n_hours']} random hours of the separate 2025 dataset with the same number "
+             f"of buses as the normal service ({ALLOC['cap']} riders per bus per hour assumed). The normal service left "
+             f"{_u['% of all riders']:.2f}% of riders without space. Sharing the same buses with our forecast left "
+             f"{_f['% of all riders']:.2f}%, which is {_f['fewer than usual service %']:.1f}% fewer. Perfect knowledge of the "
+             f"real riders would leave {_p['% of all riders']:.2f}% ({_p['fewer than usual service %']:.0f}% fewer), so better "
+             "forecasts would help most. Part of the gain comes from the sharing method itself, not only from the forecast.",
+             "allocation test result evidence does it help benefit improvement riders without space unserved overcrowding "
+             "how much better", cat="App")
     card("Holidays",
          "The holiday flag marks US federal holidays only. A weekday holiday is forecast with the Sunday pattern. "
          "Local events, school holidays, weather and service changes are not in the data.",
@@ -1539,6 +1620,7 @@ CARD_QUESTIONS = {
     "Demand levels": "What do Low, Moderate and High mean?",
     "How a prediction is made": "How is a prediction made?",
     "Resource allocation advice": "How does resource allocation work?",
+    "Does the allocation help? (test result)": "Does the allocation help?",
     "Buses needed and buses normally run": "How are the buses needed calculated?",
     "Limitations": "What are the limitations?",
     "Future improvements": "What are the future improvements?",
@@ -1744,7 +1826,7 @@ def page_home():
     st.subheader("Example")
     tomorrow = date.today() + timedelta(days=1)
     st.caption(f"Tomorrow, {tomorrow.strftime('%A %d %b')}, 8 AM")
-    tbl = route_table(tomorrow.isoformat(), 8, get_cap())
+    tbl = plan_table(tomorrow.isoformat(), 8, get_cap())
     st.markdown(compare_html(compare_data(tbl)), unsafe_allow_html=True)
     st.caption("Forecasts are estimates based on past patterns. The final decision is always made by the transport planner.")
 
@@ -1771,7 +1853,7 @@ def page_forecast():
     lo, hi = int(round(riders * (1 - e))), int(round(riders * (1 + e)))
     level, ratio = level_for(route, d, riders)
     usual = float(usual_for([route], d, hour)[0])
-    need, normal = buses_for(riders, cap), buses_for(usual, cap)
+    need, normal = bus_numbers(riders, usual, cap)
     st.markdown(result_html(route, d, hour, n, lo, hi, level, ratio, need, normal, usual,
                             quiet_tip(route, d, hour, level), reliability_line(real)),
                 unsafe_allow_html=True)
@@ -1802,7 +1884,8 @@ def page_forecast():
         fig.update_layout(title=f"Route {route}: total riders per day", yaxis_title="Riders in the day")
         fig.update_yaxes(gridcolor="rgba(127,127,127,.2)", rangemode="tozero")
         st.plotly_chart(_clean_fig(fig, 340), width="stretch")
-        st.dataframe(wk, width="stretch", hide_index=True)
+        wk_show = wk.assign(**{'Total riders': wk['Total riders'].map(lambda v: f"{v:,}")})
+        st.dataframe(wk_show, width="stretch", hide_index=True)
         st.caption("Blue = weekday, amber = weekend, red = US federal holiday (forecast like a Sunday).")
 
 
@@ -1817,8 +1900,11 @@ def page_planner():
         area = c3.selectbox("🗺️ Borough", ["All boroughs"] + BOROUGHS, key="pl_area")
         with st.expander("Settings"):
             cap = cap_setting()
-    full = route_table(d.isoformat(), hour, cap)
-    tbl = full if area == "All boroughs" else full[full['Borough'] == area].reset_index(drop=True)
+            fixed = st.checkbox("Keep the total number of buses the same (only move buses between routes)",
+                                value=True, key="pl_fixed",
+                                help="On: the same buses are shared between routes according to the forecast. "
+                                     "Off: shows the buses each route needs on its own, which can be higher everywhere.")
+    tbl = plan_table(d.isoformat(), hour, cap, area, fixed)
     if len(tbl) == 0:
         st.info("No routes in this borough.")
         return
@@ -1864,8 +1950,8 @@ def page_planner():
                    "the normal service already covers the usual rush hour.")
 
     def view(df):
-        out = df.assign(Status=df['level'].map(plain_status))[
-            ['Route', 'Borough', 'Expected riders', 'Usual riders', 'Normal buses', 'Buses needed', 'Change', 'Status']]
+        out = df.assign(Crowding=df['level'].map(plain_status))[
+            ['Route', 'Borough', 'Expected riders', 'Usual riders', 'Normal buses', 'Buses needed', 'Change', 'Crowding']]
         return out.rename(columns={'Expected riders': 'Riders expected', 'Usual riders': 'Normally at this hour'})
 
     t1, t2, t3 = st.tabs(["🔴 Need more buses", "🟢 Can spare buses", "📋 All routes"])
@@ -1886,8 +1972,16 @@ def page_planner():
     plan = view(tbl)
     st.download_button("⬇️ Download the bus plan (CSV)", plan.to_csv(index=False).encode("utf-8"),
                        file_name=f"bus_plan_{d.isoformat()}_{hour:02d}h.csv", mime="text/csv")
-    st.caption("Normal buses = buses needed for the usual riders at this hour. Buses needed = buses for the forecast. "
-               "Both use the riders-per-bus setting above.")
+    if fixed:
+        st.caption("Normal buses = buses for the usual riders at this hour. Buses needed = the best way to share the "
+                   "same total number of buses: every route keeps 1 bus, and each further bus goes where it saves the "
+                   "most riders from being left without space.")
+    else:
+        st.caption("Normal buses = buses for the usual riders at this hour. Buses needed = buses for the forecast. "
+                   "A route is only changed when its forecast is at least 5% away from usual and at least half a "
+                   "bus-load of riders.")
+    st.caption("Crowding compares the forecast with the route's own busiest hour, so a route can be very busy and still "
+               "need no extra buses. Riders per bus is an assumption (Settings).")
 
 
 # ---------------- Insights ----------------
@@ -1943,6 +2037,28 @@ def page_insights():
                    f"Grey bars are simple rules."
                    + (f" Guessing the same number every time misses by {res['MAE'].iloc[-1]:.0f} (left out of the chart)."
                       if len(show) < len(res) else ""))
+
+    alloc = info.get('allocation')
+    if alloc:
+        st.subheader("🚌 Does sharing buses with the forecast help?")
+        rows = {r['strategy']: r for r in alloc['table']}
+        order = ["Usual service", "Same as last week", "Usual riders, shared", "Our forecast, shared", "Perfect knowledge"]
+        order = [k for k in order if k in rows]
+        vals = [float(rows[k]['% of all riders']) for k in order]
+        colors = ["#9AA3B5", "#9AA3B5", INDIGO, TEAL, AMBER][:len(order)]
+        figa = go.Figure(go.Bar(x=vals[::-1], y=order[::-1], orientation="h", marker_color=colors[::-1],
+                                text=[f"{v:.2f}%" for v in vals[::-1]], textposition="outside"))
+        figa.update_layout(margin=dict(l=10, r=10, t=10, b=10), paper_bgcolor="rgba(0,0,0,0)",
+                           plot_bgcolor="rgba(0,0,0,0)", height=60 + 46 * len(order),
+                           xaxis_title="Riders who find no space on the bus (% of all riders). Lower is better.")
+        figa.update_xaxes(range=[0, max(vals) * 1.25], gridcolor="rgba(127,127,127,.2)")
+        st.plotly_chart(figa, width="stretch")
+        f, u = rows['Our forecast, shared'], rows['Usual service']
+        st.caption(f"Tested on {alloc['n_hours']} random hours of the separate 2025 data, with exactly the same number of "
+                   f"buses in every strategy and {alloc['cap']} riders per bus per hour (an assumption). Sharing the buses "
+                   f"with our forecast leaves {f['fewer than usual service %']:.1f}% fewer riders without space than the "
+                   f"usual service ({u['% of all riders']:.2f}% to {f['% of all riders']:.2f}%). Perfect knowledge would "
+                   f"do much better, so more accurate forecasts would help the most.")
 
     if RECENT is not None:
         st.subheader("🔍 Check our forecast against a real day")
@@ -2088,6 +2204,17 @@ elif page == ABOUT:
                          f"usual-average rule" + (f" ({base['MAE']:.1f})" if base else "") + ". "
                          + ("" if USE_ML_DEFAULT else "In that case the app uses the usual riders. "))
 
+    ALLOC = info.get('allocation')
+    alloc_text = ""
+    if ALLOC:
+        _a = {r['strategy']: r for r in ALLOC['table']}
+        _f, _u, _p = _a['Our forecast, shared'], _a['Usual service'], _a['Perfect knowledge']
+        alloc_text = (f"\n\n**Resource allocation test.** With the same number of buses as the normal service "
+                      f"({ALLOC['cap']} riders per bus per hour assumed), {ALLOC['n_hours']} random hours of the 2025 test "
+                      f"data left {_u['% of all riders']:.2f}% of riders without space under the normal service and "
+                      f"{_f['% of all riders']:.2f}% when the buses were shared using our forecast "
+                      f"({_f['fewer than usual service %']:.1f}% fewer). Perfect knowledge would leave "
+                      f"{_p['% of all riders']:.2f}% ({_p['fewer than usual service %']:.0f}% fewer).")
     adjust_text = ""
     if USE_PROFILE and not USE_ML_DEFAULT:
         adjust_text = ("When last week's number is not known, the app uses the usual riders for the route, weekday and "
@@ -2140,7 +2267,7 @@ elif page == ABOUT:
          "that was never used for training, and no feature uses 2025 data. The recent-level factors above use the "
          "saved 2025 riders only inside the app, after the test."),
         ("4. Results",
-         results_text + "\n\n" + table_md +
+         results_text + "\n\n" + table_md + alloc_text +
          "\n\nLower MAE, RMSE and WAPE are better. R² is high partly because routes differ a lot in size, so WAPE "
          "is the fairer score."),
         ("5. Demand patterns",
@@ -2149,17 +2276,22 @@ elif page == ABOUT:
          f"- Busiest weekday: **{busiest_day}**.\n"
          f"- Route with the most riders in the training year: **{TOP_ROUTE}**."),
         ("6. Resource allocation",
-         "For a chosen date and hour, the system forecasts every route and works out two numbers:\n\n"
-         "- **Buses needed** = forecast riders ÷ riders one bus can carry per hour.\n"
-         "- **Buses normally run** = the same calculation for the route's usual riders at that hour.\n\n"
-         "The difference is how many buses to add (+) or spare (−). Routes that need more buses are paired with "
-         "routes that can spare some, same borough first (borough is read from the route name: M, Bx, B, Q, S, or "
-         "express routes). The system also labels each route Quiet, Fairly busy or Very busy compared with its own "
-         f"busiest hour ({int(LOW_RATIO * 100)}% and {int(HIGH_RATIO * 100)}% limits). A route can be very busy at its usual "
-         "rush hour without needing extra buses, because its normal service already covers that.\n\n"
+         "For a chosen date and hour, the system forecasts every route and then shares the buses:\n\n"
+         "- **Normal buses** = riders the usual service carries ÷ riders one bus can carry per hour, rounded up "
+         "(at least 1 bus on a route that runs).\n"
+         "- **Fixed fleet:** the total number of buses stays the same as the normal service.\n"
+         "- **Sharing rule:** every running route keeps 1 bus. Each further bus goes to the route where it removes the "
+         "most *expected* riders without space, assuming the forecast is typically off by about 15%.\n"
+         "- **Buses needed** = the buses a route gets from this sharing. The difference from normal buses is how many "
+         "buses to add (+) or spare (−).\n"
+         "- Routes that gain buses are paired with routes that give buses, same borough first (borough is read from "
+         f"the route name: M, Bx, B, Q, S, or express routes).\n\n"
+         "The system also labels each route Quiet, Fairly busy or Very busy compared with its own busiest hour "
+         f"({int(LOW_RATIO * 100)}% and {int(HIGH_RATIO * 100)}% limits). A route can be very busy at its usual rush hour "
+         "without needing extra buses, because its normal service already covers that.\n\n"
          "The data has no bus capacity or timetable, so riders per bus per hour is an assumption that can be changed "
-         "on the Bus Planner page. Moves are only suggestions. A planner must check depots, vehicles, drivers and "
-         "schedules."),
+         "on the Bus Planner page. The method is tested on the separate 2025 data (see Results). Moves are only "
+         "suggestions: a planner must check depots, vehicles, drivers and schedules."),
         ("7. Limitations",
          "- The model learned from one year (2024) and was tested on January to March 2025 only.\n"
          "- Ridership counts fare payments, not passenger counters.\n"
