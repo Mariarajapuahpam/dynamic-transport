@@ -19,6 +19,10 @@ PROJECT_TITLE = "Dynamic public transport demand forecasting and resource alloca
 st.set_page_config(page_title="Bus Demand Planner", page_icon="🚌", layout="wide",
                    initial_sidebar_state="collapsed")
 
+# Shown at once, so the person sees a message (not a blank spinner) while the models load on a slow server.
+_boot = st.empty()
+_boot.info("⏳ Loading the forecasting models… the first start on the server can take up to a minute.")
+
 # ============================================================
 # Load the files saved by the notebook
 # ============================================================
@@ -48,6 +52,7 @@ def find_file(name):
 PATHS = {n: find_file(n) for n in REQUIRED_FILES + ["recent_riders.pkl"]}
 missing = [f for f in REQUIRED_FILES if PATHS[f] is None]
 if missing:
+    _boot.empty()
     st.error("These files are missing from the project folder: " + ", ".join(missing))
     found = sorted(f for f in os.listdir(BASE_DIR) if not f.startswith('.'))
     st.info("Upload them to the same place as app.py (the top level of the GitHub repository), with exactly these "
@@ -178,7 +183,7 @@ def build_trend():
     idx = RECENT.index
     act = RECENT[cols].values.astype(float)
     holiday = np.array([t.strftime('%Y-%m-%d') in HOLIDAYS for t in idx])
-    edow = np.where(holiday & (idx.dayofweek < 5), 6, idx.dayofweek)
+    edow = np.where(holiday & (idx.day_of_week < 5), 6, idx.day_of_week)
     usual = USUAL_ARR[edow, idx.hour][:, pos]
 
     def factors(mask):
@@ -195,9 +200,9 @@ def build_trend():
     try:
         tr, te = idx < pd.Timestamp('2025-03-01'), idx >= pd.Timestamp('2025-03-01')
         f = factors(tr)
-        plain_dow = idx.dayofweek
+        plain_dow = idx.day_of_week
         usual_plain = USUAL_ARR[plain_dow, idx.hour][:, pos]
-        hol = holiday & (idx.dayofweek < 5)
+        hol = holiday & (idx.day_of_week < 5)
         bt = {'base': float(np.abs(usual[te] - act[te]).mean()),
               'adj': float(np.abs(usual[te] * f - act[te]).mean()),
               'hol_plain': float(np.abs(usual_plain[hol] - act[hol]).mean()) if hol.any() else None,
@@ -2073,6 +2078,7 @@ def page_insights():
 
 
 # ---------------- page switch ----------------
+_boot.empty()
 inject_css()
 st.markdown(
     '<div class="tc-brand" style="margin-bottom:8px"><div class="tc-brand-logo">🚌</div><div>'
