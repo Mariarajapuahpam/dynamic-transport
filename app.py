@@ -244,6 +244,23 @@ if USE_ML_DEFAULT and PROXY_NAME in RESULTS:
 ML_ON = (HAS_LAG and USE_ML_DEFAULT) or (not USE_PROFILE)
 
 LOW_RATIO, HIGH_RATIO = 0.35, 0.75                # demand level = expected riders / usual busiest hour of the route
+def alloc_view(alloc):
+    """Finds the rows of the allocation test in app_info.pkl, whichever version of the notebook saved them.
+    Returns None when the test is missing, so the app still works."""
+    try:
+        rows = {r['strategy']: r for r in alloc['table']}
+        main = rows.get('Our forecast (rule, used in the app)') or rows.get('Our forecast, shared')
+        base = rows.get('Usual service')
+        if not main or not base:
+            return None
+        return {'rows': rows, 'main': main, 'base': base, 'n_hours': alloc['n_hours'], 'cap': alloc['cap'],
+                'opt': rows.get('Our forecast (optimised sharing)'),
+                'perfect': rows.get('Perfect knowledge (optimised sharing)') or rows.get('Perfect knowledge')}
+    except Exception:
+        return None
+
+
+ALLOC_VIEW = alloc_view(info.get('allocation'))
 TOP_ROUTE = max(info['top_routes'], key=info['top_routes'].get) if info.get('top_routes') else ROUTES[0]
 
 
@@ -1338,7 +1355,6 @@ def build_knowledge():
     n_routes, test_rows = info['n_routes'], info['test_rows']
     gain = (100 * (base['MAE'] - best['MAE']) / base['MAE']) if best and base and base['MAE'] else None
     bt = BACKTEST
-    ALLOC = info.get('allocation')
     cards = []
 
     def card(title, text, keywords="", table=None, cat="Project"):
@@ -1475,15 +1491,13 @@ def build_knowledge():
          "suggestion: planners must check depots, vehicles, drivers and schedules.",
          "reallocation buses move recommendation fleet allocate suggestion planner resource resource allocation "
          "how does resource allocation work method algorithm rule", cat="App")
-    if ALLOC:
-        _a = {r['strategy']: r for r in ALLOC['table']}
-        _r, _u = _a['Our forecast (rule, used in the app)'], _a['Usual service']
-        _o, _p = _a.get('Our forecast (optimised sharing)'), _a.get('Perfect knowledge (optimised sharing)')
+    if ALLOC_VIEW:
+        _r, _u, _o, _p = ALLOC_VIEW['main'], ALLOC_VIEW['base'], ALLOC_VIEW['opt'], ALLOC_VIEW['perfect']
         card("Does the allocation help? (test result)",
-             f"We tested the allocation on {ALLOC['n_hours']} random hours of the separate 2025 dataset with the same number "
-             f"of buses as the normal service ({ALLOC['cap']} riders per bus per hour assumed). The normal service left "
-             f"{_u['% of all riders']:.2f}% of riders without space. Moving buses with the simple rule used in the app and "
-             f"our forecast left {_r['% of all riders']:.2f}%, which is {_r['fewer than usual service %']:.1f}% fewer."
+             f"We tested the allocation on {ALLOC_VIEW['n_hours']} random hours of the separate 2025 dataset with the same "
+             f"number of buses as the normal service ({ALLOC_VIEW['cap']} riders per bus per hour assumed). The normal "
+             f"service left {_u['% of all riders']:.2f}% of riders without space. Moving buses with our forecast left "
+             f"{_r['% of all riders']:.2f}%, which is {_r['fewer than usual service %']:.1f}% fewer."
              + (f" A mathematical sharing method that allows for forecast errors left {_o['% of all riders']:.2f}% "
                 f"({_o['fewer than usual service %']:.1f}% fewer), but part of that gain comes from the maths and not from "
                 f"the forecast." if _o else "")
@@ -2008,29 +2022,30 @@ def page_insights():
                    + (f" Guessing the same number every time misses by {res['MAE'].iloc[-1]:.0f} (left out of the chart)."
                       if len(show) < len(res) else ""))
 
-    alloc = info.get('allocation')
-    if alloc:
+    av = ALLOC_VIEW
+    if av:
         st.subheader("🚌 Does sharing buses with the forecast help?")
-        rows = {r['strategy']: r for r in alloc['table']}
-        order = ["Usual service", "Same as last week (rule)", "Our forecast (rule, used in the app)",
-                 "Our forecast (optimised sharing)", "Usual riders (optimised sharing)", "Perfect knowledge (optimised sharing)"]
-        order = [k for k in order if k in rows]
-        vals = [float(rows[k]['% of all riders']) for k in order]
-        colors = ["#9AA3B5", "#9AA3B5", TEAL, INDIGO, INDIGO, AMBER][:len(order)]
-        figa = go.Figure(go.Bar(x=vals[::-1], y=order[::-1], orientation="h", marker_color=colors[::-1],
+        names = [("Usual service", "#9AA3B5"), ("Same as last week (rule)", "#9AA3B5"), ("Same as last week", "#9AA3B5"),
+                 ("Our forecast (rule, used in the app)", TEAL), ("Our forecast, shared", TEAL),
+                 ("Our forecast (optimised sharing)", INDIGO), ("Usual riders (optimised sharing)", INDIGO),
+                 ("Usual riders, shared", INDIGO), ("Perfect knowledge (optimised sharing)", AMBER),
+                 ("Perfect knowledge", AMBER)]
+        order = [(k, c) for k, c in names if k in av['rows']]
+        vals = [float(av['rows'][k]['% of all riders']) for k, _ in order]
+        figa = go.Figure(go.Bar(x=vals[::-1], y=[k for k, _ in order][::-1], orientation="h",
+                                marker_color=[c for _, c in order][::-1],
                                 text=[f"{v:.2f}%" for v in vals[::-1]], textposition="outside"))
         figa.update_layout(margin=dict(l=10, r=10, t=10, b=10), paper_bgcolor="rgba(0,0,0,0)",
                            plot_bgcolor="rgba(0,0,0,0)", height=60 + 46 * len(order),
                            xaxis_title="Riders who find no space on the bus (% of all riders). Lower is better.")
         figa.update_xaxes(range=[0, max(vals) * 1.25], gridcolor="rgba(127,127,127,.2)")
         st.plotly_chart(figa, width="stretch")
-        r, u = rows['Our forecast (rule, used in the app)'], rows['Usual service']
-        st.caption(f"Tested on {alloc['n_hours']} random hours of the separate 2025 data, with exactly the same number of "
-                   f"buses in every strategy and {alloc['cap']} riders per bus per hour (an assumption). Moving buses with "
-                   f"our forecast and the simple rule used in this app leaves {r['fewer than usual service %']:.1f}% fewer "
-                   f"riders without space than the usual service ({u['% of all riders']:.2f}% to {r['% of all riders']:.2f}%). "
-                   f"The optimised sharing (an extension) does better, partly because of the maths itself. Perfect "
-                   f"knowledge would do much better, so more accurate forecasts would help the most.")
+        r, u = av['main'], av['base']
+        st.caption(f"Tested on {av['n_hours']} random hours of the separate 2025 data, with exactly the same number of "
+                   f"buses in every strategy and {av['cap']} riders per bus per hour (an assumption). Moving buses with "
+                   f"our forecast leaves {r['fewer than usual service %']:.1f}% fewer riders without space than the "
+                   f"usual service ({u['% of all riders']:.2f}% to {r['% of all riders']:.2f}%). Perfect knowledge would "
+                   f"do much better, so more accurate forecasts would help the most.")
 
     if RECENT is not None:
         st.subheader("🔍 Check our forecast against a real day")
@@ -2176,17 +2191,14 @@ elif page == ABOUT:
                          f"usual-average rule" + (f" ({base['MAE']:.1f})" if base else "") + ". "
                          + ("" if USE_ML_DEFAULT else "In that case the app uses the usual riders. "))
 
-    ALLOC = info.get('allocation')
     alloc_text = ""
-    if ALLOC:
-        _a = {r['strategy']: r for r in ALLOC['table']}
-        _r, _u = _a['Our forecast (rule, used in the app)'], _a['Usual service']
-        _o, _p = _a.get('Our forecast (optimised sharing)'), _a.get('Perfect knowledge (optimised sharing)')
+    if ALLOC_VIEW:
+        _r, _u, _o, _p = ALLOC_VIEW['main'], ALLOC_VIEW['base'], ALLOC_VIEW['opt'], ALLOC_VIEW['perfect']
         alloc_text = (f"\n\n**Resource allocation test.** With the same number of buses as the normal service "
-                      f"({ALLOC['cap']} riders per bus per hour assumed), {ALLOC['n_hours']} random hours of the 2025 test "
-                      f"data left {_u['% of all riders']:.2f}% of riders without space under the normal service and "
-                      f"{_r['% of all riders']:.2f}% when buses were moved with our forecast and the simple rule used in "
-                      f"the app ({_r['fewer than usual service %']:.1f}% fewer)."
+                      f"({ALLOC_VIEW['cap']} riders per bus per hour assumed), {ALLOC_VIEW['n_hours']} random hours of the 2025 "
+                      f"test data left {_u['% of all riders']:.2f}% of riders without space under the normal service and "
+                      f"{_r['% of all riders']:.2f}% when buses were moved with our forecast "
+                      f"({_r['fewer than usual service %']:.1f}% fewer)."
                       + (f" An optimised sharing method left {_o['% of all riders']:.2f}% ({_o['fewer than usual service %']:.1f}% "
                          f"fewer), but part of that gain comes from the maths and not from the forecast." if _o else "")
                       + (f" Perfect knowledge would leave {_p['% of all riders']:.2f}% ({_p['fewer than usual service %']:.0f}% fewer)."
