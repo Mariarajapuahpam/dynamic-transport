@@ -299,10 +299,28 @@ def calendar_frame(routes, d, hour):
 
 
 def has_real_lag(d, hour):
-    """True if the real riders from exactly one week earlier are saved for this date and hour."""
+    """True if the real riders from exactly one week earlier are saved for this date and hour AND can be used.
+    They cannot be used when that day was a weekday holiday and this day is not: a holiday is not a normal 'last week'
+    (in the saved data this made the error 38 riders instead of 17)."""
     if RECENT is None:
         return False
+    ld = d - timedelta(days=7)
+    if is_holiday(ld) and ld.weekday() < 5 and not is_holiday(d):
+        return False
     return (pd.Timestamp(d.year, d.month, d.day, hour) - pd.Timedelta(hours=168)) in RECENT.index
+
+
+def holiday_note(d):
+    """A short explanation shown when the chosen day is a US federal holiday on a weekday."""
+    if is_holiday(d) and d.weekday() < 5:
+        return (f"🎌 {d.strftime('%A %d %b %Y')} is a US federal holiday. Ridership on holidays is lower than on a normal "
+                "weekday and differs from holiday to holiday. The 'usual riders' and the normal buses are taken from a "
+                "normal Sunday, so the real service on that day may be different.")
+    ld = d - timedelta(days=7)
+    if is_holiday(ld) and ld.weekday() < 5 and not is_holiday(d):
+        return (f"ℹ️ The same day last week ({ld.strftime('%d %b')}) was a holiday, so it is not used as 'last week'. "
+                "The forecast uses the usual riders and the route's recent level instead.")
+    return None
 
 
 def recent_lag(routes, d, hour):
@@ -1838,6 +1856,9 @@ def page_forecast():
                     lag = float(st.number_input("Riders last week (same route, same hour)",
                                                 min_value=0, value=0, step=10, key="w_lag"))
     cap = get_cap()
+    _hn = holiday_note(d)
+    if _hn:
+        st.info(_hn)
     riders = float(predict_routes([route], d, hour, lag)[0])
     n = int(round(riders))
     real = lag is not None or has_real_lag(d, hour)
@@ -1901,6 +1922,9 @@ def page_planner():
     if len(tbl) == 0:
         st.info("No routes in this borough.")
         return
+    _hn = holiday_note(d)
+    if _hn:
+        st.info(_hn)
     when_txt = f"{fmt_hour(hour)} on {d.strftime('%A %d %b')}"
     n_more, n_spare = int((tbl['Change'] > 0).sum()), int((tbl['Change'] < 0).sum())
     extra, spare = int(tbl.loc[tbl['Change'] > 0, 'Change'].sum()), int(-tbl.loc[tbl['Change'] < 0, 'Change'].sum())
@@ -1921,7 +1945,14 @@ def page_planner():
     moves = build_moves(tbl, limit=30)
     st.subheader("🔁 Suggested bus moves")
     if moves.empty:
-        st.info("No bus moves are needed with these settings.")
+        if n_more and not n_spare:
+            st.info(f"No buses can be moved: {n_more} routes need more buses, but no route has a bus to spare at this "
+                    "time. The extra buses would have to come from outside these routes (for example from other hours or "
+                    "depots).")
+        elif n_spare and not n_more:
+            st.info(f"No buses need to be moved: {n_spare} routes could spare buses, but no route needs more.")
+        else:
+            st.info("No bus moves are needed: every route can keep its normal buses.")
     else:
         st.dataframe(moves, width="stretch", hide_index=True)
         if extra > spare:
